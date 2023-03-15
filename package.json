@@ -1,0 +1,17 @@
+{
+  "name": "switchboardmonitorbot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@solana/web3.js": "^1.73.3",
+    "@switchboard-xyz/solana.js": "^2.0.138",
+    "dotenv": "^16.0.3",
+    "telebot": "^1.4.1"
+  }
+}
