@@ -10,8 +10,10 @@
   "license": "ISC",
   "dependencies": {
     "@google-cloud/storage": "^6.9.4",
+    "@solana/spl-token": "^0.3.7",
     "@solana/web3.js": "^1.73.3",
-    "@switchboard-xyz/solana.js": "^2.0.138",
+    "@switchboard-xyz/solana.js": "^2.1.1",
+    "bn.js": "^5.2.1",
     "dotenv": "^16.0.3",
     "telebot": "^1.4.1"
   }
