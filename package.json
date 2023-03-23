@@ -9,12 +9,10 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@google-cloud/storage": "^6.9.4",
     "@solana/web3.js": "^1.73.3",
     "@switchboard-xyz/solana.js": "^2.0.138",
     "dotenv": "^16.0.3",
     "telebot": "^1.4.1"
-  },
-  "devDependencies": {
-    "eslint": "^8.36.0"
   }
 }
