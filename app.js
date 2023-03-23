@@ -1,42 +1,69 @@
 require("dotenv").config();
 const TeleBot = require("telebot");
-const {Storage} = require('@google-cloud/storage');
-const { clusterApiUrl, Connection, SolanaJSONRPCError } = require("@solana/web3.js");
-const { AggregatorAccount, SwitchboardProgram } = require("@switchboard-xyz/solana.js");
+const { Storage } = require("@google-cloud/storage");
+const {
+  clusterApiUrl,
+  Connection,
+  SolanaJSONRPCError,
+  PublicKey,
+} = require("@solana/web3.js");
+const {
+  AggregatorAccount,
+  SwitchboardProgram,
+  QueueAccount,
+  types,
+} = require("@switchboard-xyz/solana.js");
+const spl = require("@solana/spl-token");
+const BN = require("bn.js");
 const tgToken = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new TeleBot(tgToken);
 const map = new Map();
-const storage = new Storage({keyFilename: '//Users/yy/Desktop/docus/numeric-analogy-378406-ece1e2bcdb4b.json'});
+// map of aggregator address, to lease escrow pubkeys
+const escrowMap = new Map();
+const storage = new Storage({
+  keyFilename:
+    "//Users/yy/Desktop/docus/numeric-analogy-378406-ece1e2bcdb4b.json",
+});
 
 async function saveMapToGCP() {
-  const bucketName = 'tg-bot-map-bucket';
-  const fileName = 'map.json';
+  const bucketName = "tg-bot-map-bucket";
+  const fileName = "map.json";
   const mapEntries = [...map.entries()];
-  const entriesArray = mapEntries.map(([key, value]) => [key, value[0], value[1], value[2], value[3]]);
+  const entriesArray = mapEntries.map(([key, value]) => [
+    key,
+    value[0],
+    value[1],
+    value[2],
+    value[3],
+  ]);
   const mapJsonString = JSON.stringify(entriesArray);
   console.log(mapJsonString);
-  console.log('[app.js] Uploading file to GCP...');
+  console.log("[app.js] Uploading file to GCP...");
   const bucket = storage.bucket(bucketName);
   const file = bucket.file(fileName);
   await file.save(mapJsonString, {
-    contentType:'application/json',
+    contentType: "application/json",
   });
   console.log(`[app.js] File ${fileName} uploaded successfully!`);
-};
+}
 
 async function downloadMapFromGCP() {
-  const bucketName = 'tg-bot-map-bucket';
-  const fileName = 'map.json';
+  const bucketName = "tg-bot-map-bucket";
+  const fileName = "map.json";
   const file = storage.bucket(bucketName).file(fileName);
   const [fileExists] = await file.exists();
   if (!fileExists) {
-    console.log(`[app.js] File ${fileName} does not exist in bucket ${bucketName}.`);
+    console.log(
+      `[app.js] File ${fileName} does not exist in bucket ${bucketName}.`
+    );
     return;
   } else {
     const [data] = await file.download();
     const mapJsonString = data.toString();
     if (mapJsonString === "") {
-      console.log(`[app.js] File ${fileName} does not contain any content: ${mapJsonString}`);
+      console.log(
+        `[app.js] File ${fileName} does not contain any content: ${mapJsonString}`
+      );
       return;
     } else {
       const mapData = JSON.parse(mapJsonString);
@@ -44,14 +71,81 @@ async function downloadMapFromGCP() {
       console.log(itemsArray);
       for (const item of itemsArray) {
         const key = item[0];
-        const value = [item[1], item[2], item[3], item[4]]
+        const value = [item[1], item[2], item[3], item[4]];
         map.set(key, value);
-      };
-      console.log('[app.js] Map downloaded successfully!');
+      }
+      console.log("[app.js] Map downloaded successfully!");
       console.log(map);
-    };
-  };
-};
+    }
+  }
+}
+
+async function fetchLeaseBalances(program) {
+  // map of aggregator addr to lease balance
+  const balanceMap = new Map();
+
+  const aggregators = Array.from(map.entries());
+
+  // first, gather all lease escrow pubkeys
+  const pubkeys = [];
+  for (const [
+    addr,
+    [username, id, alertBalance, leaseBalance],
+  ] of aggregators) {
+    const escrowPubkey = escrowMap.get(addr);
+    if (escrowPubkey) {
+      pubkeys.push(new PublicKey(escrowPubkey));
+    } else {
+      // only need to do this on the first run
+
+      const aggregatorAccount = new AggregatorAccount(program, addr);
+      const aggregator = await aggregatorAccount.loadData();
+      const queueAccount = new QueueAccount(program, aggregator.queuePubkey);
+      const queue = await queueAccount.loadData();
+      const accounts = await aggregatorAccount.getAccounts(
+        queueAccount,
+        queue.authority
+      );
+      escrowMap.set(addr, accounts.leaseEscrow.toBase58());
+      pubkeys.push(accounts.leaseEscrow);
+
+      // will break if they transfer queues, we can use a setTimeout of 30min to auto-remove from the map so it refreshes
+      setTimeout(() => {
+        escrowMap.delete(addr);
+      }, 30 * 60 * 1000);
+    }
+  }
+
+  const tokenAccountInfos = await program.connection.getMultipleAccountsInfo(
+    pubkeys
+  );
+
+  for (const [i, tokenAccountInfo] of tokenAccountInfos.entries()) {
+    const aggregatorAddr = aggregators[i][0];
+    try {
+      const leaseEscrowPubkey = pubkeys[i];
+      if (!tokenAccountInfo) {
+        console.error(`Failed to fetch token account for ${aggregatorAddr}`);
+        continue;
+      }
+
+      const tokenAccount = spl.unpackAccount(
+        leaseEscrowPubkey,
+        tokenAccountInfo
+      );
+      const amountSwbDecimal = new types.SwitchboardDecimal({
+        mantissa: new BN(tokenAccount.amount),
+        scale: 9, // wrap SOL has 9 decimal places
+      });
+      const amount = amountSwbDecimal.toBig().toNumber();
+      balanceMap.set(aggregatorAddr, amount);
+    } catch (error) {
+      console.error(`Failed to fetch lease balance for ${aggregatorAddr}`);
+    }
+  }
+
+  return balanceMap;
+}
 
 async function updateAndAlert() {
   const connection = new Connection(clusterApiUrl("mainnet-beta"));
@@ -59,25 +153,32 @@ async function updateAndAlert() {
 
   setInterval(async () => {
     if (map.size >= 1) {
-      for (const [addr, [username, id, alertBalance, leaseBalance]] of map.entries()) {
-          const aggregatorAccount = new AggregatorAccount(program, addr);
-          const newBalance = await aggregatorAccount.fetchBalance();
-          map.set(addr, [username, id, alertBalance, newBalance]);
-          console.log(map);
+      const balances = await fetchLeaseBalances(program);
+
+      for (const [
+        addr,
+        [username, id, alertBalance, leaseBalance],
+      ] of map.entries()) {
+        const newBalance = balances.get(addr);
+        if (!balance) {
+          console.error(`Failed to get balance for aggregator ${addr}`);
+          continue;
+        }
+        map.set(addr, [username, id, alertBalance, newBalance]);
+        console.log(map);
 
         if (newBalance <= alertBalance) {
-            const message = `⚠️ Alert: ${addr}\n\nThe lease has reached *${newBalance}*!\n\nYour subscription has ended for ${addr}\nPlease re-subscribe to get alerts for your feed.`;
-            bot.sendMessage(id, message)
-            .catch((error) => {
-                console.log("supdateAlert error:" + JSON.stringify(error))
-            })
-            map.delete(addr);
-            console.log(map);
-        };
-      };
-    };
-  } , 30000);
-};
+          const message = `⚠️ Alert: ${addr}\n\nThe lease has reached *${newBalance}*!\n\nYour subscription has ended for ${addr}\nPlease re-subscribe to get alerts for your feed.`;
+          bot.sendMessage(id, message).catch((error) => {
+            console.log("supdateAlert error:" + JSON.stringify(error));
+          });
+          map.delete(addr);
+          console.log(map);
+        }
+      }
+    }
+  }, 30000);
+}
 
 async function checkAddress(addr) {
   const connection = new Connection(clusterApiUrl("mainnet-beta"));
@@ -91,7 +192,7 @@ async function checkAddress(addr) {
     }
   } catch (err) {
     if (err instanceof SolanaJSONRPCError && err.code === -32602) {
-      console.log('Retry 0');
+      console.log("Retry 0");
       while (true) {
         try {
           const validAddress = await aggregatorAccount.fetchAccounts();
@@ -102,20 +203,20 @@ async function checkAddress(addr) {
         } catch (err) {
           console.log(err);
         }
-        await new Promise(resolve => setTimeout(resolve, 1000));
+        await new Promise((resolve) => setTimeout(resolve, 1000));
       }
     } else {
       console.log(err);
       return false;
     }
   }
-};
+}
 
 function startCommand(msg) {
   msg.reply.text(
     "Welcome to Switchboard Monitor Bot! \n\nPlease check the menu or do /help for a list of commands to help you start subscribing to monitor your lease escrows.\n\nNote: All subscription commands follow this example:\n{Enter command}\n{Enter address}\n{Enter alertBalance}"
   );
-};
+}
 
 function helpCommand(msg) {
   msg.reply.text(
@@ -128,19 +229,21 @@ function helpCommand(msg) {
       "/unsubmass:    Unsubscribe to multiple feed addresses\n\n" +
       "/list:                   List of feeds you're currently subscribed to"
   );
-};
+}
 
 async function subCommand(msg) {
   const lines = msg.text.split("\n").slice(1);
   const alertBalance = Number(lines.pop());
   const id = msg.chat.id;
   const username = msg.chat.username;
-  console.log(lines)
+  console.log(lines);
 
   if (lines.length === 0 || isNaN(alertBalance)) {
-    msg.reply.text('Please specify in this manner to subscribe to get an alert.\n\nFor example:\n/sub\n{Enter address}\n{Enter next address}\n{Enter alertBalance}');
+    msg.reply.text(
+      "Please specify in this manner to subscribe to get an alert.\n\nFor example:\n/sub\n{Enter address}\n{Enter next address}\n{Enter alertBalance}"
+    );
     return;
-  };
+  }
 
   const invalidAddresses = [];
   const subscribedAddresses = [];
@@ -148,24 +251,27 @@ async function subCommand(msg) {
   const highBalanceAddresses = [];
 
   for (const addr of lines) {
-    msg.reply.text(`Please wait a moment, checking address:\n\n${addr}`)
+    msg.reply.text(`Please wait a moment, checking address:\n\n${addr}`);
     if (!addr || addr.length !== 44) {
       invalidAddresses.push(addr);
       continue;
-    };
+    }
 
-    for (const [mapAddr, [mapUsername, mapId, mapAlertBalance, mapLeaseBalance]] of map.entries()) {
+    for (const [
+      mapAddr,
+      [mapUsername, mapId, mapAlertBalance, mapLeaseBalance],
+    ] of map.entries()) {
       if (mapUsername === username && mapAddr === addr && mapId === id) {
         subscribedAddresses.push(addr);
         break;
-      };
-    };
+      }
+    }
 
     const isValid = await checkAddress(addr);
     if (!isValid) {
       notFoundAddresses.push(addr);
       continue;
-    };  
+    }
 
     const connection = new Connection(clusterApiUrl("mainnet-beta"));
     const program = await SwitchboardProgram.load("mainnet-beta", connection);
@@ -175,25 +281,40 @@ async function subCommand(msg) {
     if (currentBalance <= alertBalance) {
       highBalanceAddresses.push(addr);
       continue;
-    };
-  };
+    }
+  }
 
   if (invalidAddresses.length > 0) {
     msg.reply.text(`The address is invalid:\n\n${invalidAddresses.join("\n")}`);
   } else if (subscribedAddresses.length > 0) {
-    msg.reply.text(`The address was previously subscribed:\n\n${subscribedAddresses.join("\n")}`);
+    msg.reply.text(
+      `The address was previously subscribed:\n\n${subscribedAddresses.join(
+        "\n"
+      )}`
+    );
   } else if (notFoundAddresses.length > 0) {
-    msg.reply.text(`The address was not found:\n\n${notFoundAddresses.join("\n")}`);
+    msg.reply.text(
+      `The address was not found:\n\n${notFoundAddresses.join("\n")}`
+    );
   } else if (highBalanceAddresses.length > 0) {
-    msg.reply.text(`The address has an alert balance that is greater than the current lease balance:\n\n${highBalanceAddresses.join("\n")}`);
+    msg.reply.text(
+      `The address has an alert balance that is greater than the current lease balance:\n\n${highBalanceAddresses.join(
+        "\n"
+      )}`
+    );
   } else {
     for (const addr of lines) {
-      map.set(`${addr}`, [`${username}`, `${id}`, `${alertBalance}`, 'New subscription']);
-    };
+      map.set(`${addr}`, [
+        `${username}`,
+        `${id}`,
+        `${alertBalance}`,
+        "New subscription",
+      ]);
+    }
     msg.reply.text(`Subscriptions set for:\n\n🟢 ${lines.join("\n🟢 ")}`);
     console.log(map);
-  };
-};
+  }
+}
 
 async function submassCommand(msg) {
   const lines = msg.text.split("\n").slice(1);
@@ -202,9 +323,11 @@ async function submassCommand(msg) {
   const username = msg.chat.username;
 
   if (lines.length === 0 || isNaN(alertBalance)) {
-    msg.reply.text('Please specify in this manner to subscribe to get an alert.\n\nFor example:\n/sub\n{Enter address}\n{Enter next address}\n{Enter alertBalance}');
+    msg.reply.text(
+      "Please specify in this manner to subscribe to get an alert.\n\nFor example:\n/sub\n{Enter address}\n{Enter next address}\n{Enter alertBalance}"
+    );
     return;
-  };
+  }
 
   const invalidAddresses = [];
   const subscribedAddresses = [];
@@ -212,24 +335,27 @@ async function submassCommand(msg) {
   const highBalanceAddresses = [];
 
   for (const addr of lines) {
-    msg.reply.text(`Please wait a moment, checking address:\n\n${addr}`)
+    msg.reply.text(`Please wait a moment, checking address:\n\n${addr}`);
     if (!addr || addr.length !== 44) {
       invalidAddresses.push(addr);
       continue;
-    };
+    }
 
-    for (const [mapAddr, [mapUsername, mapId, mapAlertBalance, mapLeaseBalance]] of map.entries()) {
+    for (const [
+      mapAddr,
+      [mapUsername, mapId, mapAlertBalance, mapLeaseBalance],
+    ] of map.entries()) {
       if (mapUsername === username && mapAddr === addr && mapId === id) {
         subscribedAddresses.push(addr);
         break;
-      };
-    };
+      }
+    }
 
     const isValid = await checkAddress(addr);
     if (!isValid) {
       notFoundAddresses.push(addr);
       continue;
-    };  
+    }
 
     const connection = new Connection(clusterApiUrl("mainnet-beta"));
     const program = await SwitchboardProgram.load("mainnet-beta", connection);
@@ -239,25 +365,42 @@ async function submassCommand(msg) {
     if (currentBalance <= alertBalance) {
       highBalanceAddresses.push(addr);
       continue;
-    };
-  };
+    }
+  }
 
   if (invalidAddresses.length > 0) {
-    msg.reply.text(`The following addresses are invalid:\n\n${invalidAddresses.join("\n")}`);
+    msg.reply.text(
+      `The following addresses are invalid:\n\n${invalidAddresses.join("\n")}`
+    );
   } else if (subscribedAddresses.length > 0) {
-    msg.reply.text(`The following addresses were previously subscribed:\n\n${subscribedAddresses.join("\n")}`);
+    msg.reply.text(
+      `The following addresses were previously subscribed:\n\n${subscribedAddresses.join(
+        "\n"
+      )}`
+    );
   } else if (notFoundAddresses.length > 0) {
-    msg.reply.text(`The address was not found:\n\n${notFoundAddresses.join("\n")}`);
+    msg.reply.text(
+      `The address was not found:\n\n${notFoundAddresses.join("\n")}`
+    );
   } else if (highBalanceAddresses.length > 0) {
-    msg.reply.text(`The following addresses have an alert balance that is lower than the current lease balance:\n\n${highBalanceAddresses.join("\n")}`);
+    msg.reply.text(
+      `The following addresses have an alert balance that is lower than the current lease balance:\n\n${highBalanceAddresses.join(
+        "\n"
+      )}`
+    );
   } else {
     for (const addr of lines) {
-      map.set(`${addr}`, [`${username}`, `${id}`, `${alertBalance}`, 'New subscription']);
-    };
+      map.set(`${addr}`, [
+        `${username}`,
+        `${id}`,
+        `${alertBalance}`,
+        "New subscription",
+      ]);
+    }
     msg.reply.text(`Subscriptions set for:\n\n🟢 ${lines.join("\n🟢 ")}`);
     console.log(map);
-  };
-};
+  }
+}
 
 function unsubCommand(msg) {
   const lines = msg.text.split("\n").slice(1);
@@ -265,7 +408,9 @@ function unsubCommand(msg) {
   const username = msg.chat.username;
 
   if (!lines || lines.length === 0) {
-    msg.reply.text('Please specify in this manner to unsubscribe.\n\nFor example:\n/unsub\n{Enter address}');
+    msg.reply.text(
+      "Please specify in this manner to unsubscribe.\n\nFor example:\n/unsub\n{Enter address}"
+    );
     return;
   }
 
@@ -275,41 +420,48 @@ function unsubCommand(msg) {
 
   for (const addr of lines) {
     const values = map.get(addr);
-    console.log(values)
+    console.log(values);
 
     if (addr.length !== 44) {
       invalidAddresses.push(addr);
       continue;
-    };
+    }
 
     if (!values) {
       notFoundAddresses.push(addr);
       continue;
-    };
+    }
 
-    for (const [mapAddr, [mapUsername, mapId, mapAlertBalance, mapLeaseBalance]] of map.entries()) {
+    for (const [
+      mapAddr,
+      [mapUsername, mapId, mapAlertBalance, mapLeaseBalance],
+    ] of map.entries()) {
       if (mapUsername !== username && mapId !== id) {
         notYoursAddresses.push(addr);
         break;
-      };
-    };
-  };
+      }
+    }
+  }
 
   if (invalidAddresses.length > 0) {
     msg.reply.text(`The address is invalid:\n\n${invalidAddresses.join("\n")}`);
   } else if (notFoundAddresses.length > 0) {
-    console.log('imhere4')
-    msg.reply.text(`The address was not found:\n\n${notFoundAddresses.join("\n")}`);
+    console.log("imhere4");
+    msg.reply.text(
+      `The address was not found:\n\n${notFoundAddresses.join("\n")}`
+    );
   } else if (notYoursAddresses.length > 0) {
-    msg.reply.text(`The address was not found:\n\n${notYoursAddresses.join("\n")}`);
+    msg.reply.text(
+      `The address was not found:\n\n${notYoursAddresses.join("\n")}`
+    );
   } else {
     for (const addr of lines) {
       map.delete(addr);
-    };
+    }
     msg.reply.text(`Subscription removed for\n\n🔴 ${lines.join("\n🔴 ")}`);
     console.log(map);
-  };
-};
+  }
+}
 
 function unsubmassCommand(msg) {
   const lines = msg.text.split("\n").slice(1);
@@ -317,7 +469,9 @@ function unsubmassCommand(msg) {
   const username = msg.chat.username;
 
   if (!lines || lines.length === 0) {
-    msg.reply.text('Please specify in this manner to unsubscribe.\n\nFor example:\n/unsub\n{Enter address}\n{Enter next address}');
+    msg.reply.text(
+      "Please specify in this manner to unsubscribe.\n\nFor example:\n/unsub\n{Enter address}\n{Enter next address}"
+    );
     return;
   }
 
@@ -336,30 +490,39 @@ function unsubmassCommand(msg) {
     if (!values) {
       notFoundAddresses.push(addr);
       continue;
-    };
+    }
 
-    for (const [mapAddr, [mapUsername, mapId, mapAlertBalance, mapLeaseBalance]] of map.entries()) {
+    for (const [
+      mapAddr,
+      [mapUsername, mapId, mapAlertBalance, mapLeaseBalance],
+    ] of map.entries()) {
       if (mapUsername !== username && mapId !== id) {
         notYoursAddresses.push(addr);
         continue;
-      };
-    };
-  };
+      }
+    }
+  }
 
   if (invalidAddresses.length > 0) {
-    msg.reply.text(`The addresses are invalid:\n\n${invalidAddresses.join("\n")}`);
+    msg.reply.text(
+      `The addresses are invalid:\n\n${invalidAddresses.join("\n")}`
+    );
   } else if (notFoundAddresses.length > 0) {
-    msg.reply.text(`The addresses were not found:\n\n${notFoundAddresses.join("\n")}`);
+    msg.reply.text(
+      `The addresses were not found:\n\n${notFoundAddresses.join("\n")}`
+    );
   } else if (notYoursAddresses.length > 0) {
-    msg.reply.text(`The addresses were not found:\n\n${notYoursAddresses.join("\n")}`);
+    msg.reply.text(
+      `The addresses were not found:\n\n${notYoursAddresses.join("\n")}`
+    );
   } else {
     for (const addr of lines) {
       map.delete(addr);
-    };
+    }
     msg.reply.text(`Subscription removed for\n\n🔴 ${lines.join("\n🔴 ")}`);
     console.log(map);
-  };
-};
+  }
+}
 
 function listCommand(msg) {
   const username = msg.chat.username;
@@ -374,7 +537,7 @@ function listCommand(msg) {
   } else {
     msg.reply.text(`No subscriptions found for ${username}`);
   }
-};
+}
 
 bot.on("/start", startCommand);
 bot.on("/help", helpCommand);
@@ -384,53 +547,52 @@ bot.on("/unsubscribe", unsubCommand);
 bot.on("/unsubmass", unsubmassCommand);
 bot.on("/list", listCommand);
 
-updateAndAlert()
-  .then(console.log("[app.js] Running updateAndAlert"));
+updateAndAlert().then(console.log("[app.js] Running updateAndAlert"));
 
 bot.start();
 
-process.on('SIGTERM', async () => {
-  console.log('[app.js] Received SIGTERM signal.');
+process.on("SIGTERM", async () => {
+  console.log("[app.js] Received SIGTERM signal.");
   await saveMapToGCP();
   process.exit(0);
 });
 
-process.on('SIGINT', async () => {
-  console.log('[app.js] Received SIGINT signal.');
+process.on("SIGINT", async () => {
+  console.log("[app.js] Received SIGINT signal.");
   await saveMapToGCP();
   process.exit(0);
 });
 
-process.on('SIGHUP', async () => {
-  console.log('[app.js] Received SIGHUP signal.');
+process.on("SIGHUP", async () => {
+  console.log("[app.js] Received SIGHUP signal.");
   await saveMapToGCP();
   process.exit(0);
 });
 
-process.on('SIGTSTP', async () => {
-  console.log('[app.js] Received SIGTSTP signal.');
+process.on("SIGTSTP", async () => {
+  console.log("[app.js] Received SIGTSTP signal.");
   await saveMapToGCP();
   process.exit(0);
 });
 
-process.on('uncaughtException', async (error) => {
-  console.error('[app.js] Uncaught exception:', error);
+process.on("uncaughtException", async (error) => {
+  console.error("[app.js] Uncaught exception:", error);
   await saveMapToGCP();
   process.exit(1);
 });
 
-process.on('unhandledRejection', async (reason, promise) => {
-  console.error('[app.js] Unhandled rejection at:', promise, 'reason:', reason);
+process.on("unhandledRejection", async (reason, promise) => {
+  console.error("[app.js] Unhandled rejection at:", promise, "reason:", reason);
   await saveMapToGCP();
   process.exit(1);
 });
 
-process.on('beforeExit', async () => {
-  console.log('[app.js] Received beforeExit signal.');
+process.on("beforeExit", async () => {
+  console.log("[app.js] Received beforeExit signal.");
   await saveMapToGCP();
 });
 
 process.nextTick(async () => {
-  console.log('[app.js] Downloading map from GCP...');
+  console.log("[app.js] Downloading map from GCP...");
   await downloadMapFromGCP();
 });
