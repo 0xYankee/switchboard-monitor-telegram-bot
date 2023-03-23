@@ -1,30 +1,28 @@
+require("dotenv").config();
 const TeleBot = require("telebot");
 const {Storage} = require('@google-cloud/storage');
-require("dotenv").config();
-
+const { clusterApiUrl, Connection, SolanaJSONRPCError } = require("@solana/web3.js");
+const { AggregatorAccount, SwitchboardProgram } = require("@switchboard-xyz/solana.js");
 const tgToken = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new TeleBot(tgToken);
 const map = new Map();
-const storage = new Storage();
+const storage = new Storage({keyFilename: '//Users/yy/Desktop/docus/numeric-analogy-378406-ece1e2bcdb4b.json'});
 
-process.on('beforeExit', async () => {
+async function saveMapToGCP() {
   const bucketName = 'tg-bot-map-bucket';
   const fileName = 'map.json';
-  const mapJsonString = JSON.stringify(map);
+  const mapEntries = [...map.entries()];
+  const entriesArray = mapEntries.map(([key, value]) => [key, value[0], value[1], value[2], value[3]]);
+  const mapJsonString = JSON.stringify(entriesArray);
+  console.log(mapJsonString);
   console.log('[app.js] Uploading file to GCP...');
   const bucket = storage.bucket(bucketName);
   const file = bucket.file(fileName);
   await file.save(mapJsonString, {
     contentType:'application/json',
   });
-  console.log(`File ${fileName} uploaded successfully!`);
-});
-
-process.nextTick(async () => {
-  console.log('[app.js] Downloading map from GCP...');
-  await downloadMapFromGCP();
-  console.log('[app.js] Map downloaded successfully!');
-});
+  console.log(`[app.js] File ${fileName} uploaded successfully!`);
+};
 
 async function downloadMapFromGCP() {
   const bucketName = 'tg-bot-map-bucket';
@@ -32,20 +30,28 @@ async function downloadMapFromGCP() {
   const file = storage.bucket(bucketName).file(fileName);
   const [fileExists] = await file.exists();
   if (!fileExists) {
-    console.log(`File ${fileName} does not exist in bucket ${bucketName}.`);
+    console.log(`[app.js] File ${fileName} does not exist in bucket ${bucketName}.`);
     return;
   } else {
     const [data] = await file.download();
     const mapJsonString = data.toString();
-    const mapData = JSON.parse(mapJsonString);
-    for (const [key, value] of Object.entries(mapData)) {
-      map.set(key, value);
+    if (mapJsonString === "") {
+      console.log(`[app.js] File ${fileName} does not contain any content: ${mapJsonString}`);
+      return;
+    } else {
+      const mapData = JSON.parse(mapJsonString);
+      const itemsArray = Object.values(mapData);
+      console.log(itemsArray);
+      for (const item of itemsArray) {
+        const key = item[0];
+        const value = [item[1], item[2], item[3], item[4]]
+        map.set(key, value);
+      };
+      console.log('[app.js] Map downloaded successfully!');
+      console.log(map);
     };
   };
 };
-
-const { clusterApiUrl, Connection, SolanaJSONRPCError } = require("@solana/web3.js");
-const { AggregatorAccount, SwitchboardProgram } = require("@switchboard-xyz/solana.js");
 
 async function updateAndAlert() {
   const connection = new Connection(clusterApiUrl("mainnet-beta"));
@@ -382,3 +388,49 @@ updateAndAlert()
   .then(console.log("[app.js] Running updateAndAlert"));
 
 bot.start();
+
+process.on('SIGTERM', async () => {
+  console.log('[app.js] Received SIGTERM signal.');
+  await saveMapToGCP();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.log('[app.js] Received SIGINT signal.');
+  await saveMapToGCP();
+  process.exit(0);
+});
+
+process.on('SIGHUP', async () => {
+  console.log('[app.js] Received SIGHUP signal.');
+  await saveMapToGCP();
+  process.exit(0);
+});
+
+process.on('SIGTSTP', async () => {
+  console.log('[app.js] Received SIGTSTP signal.');
+  await saveMapToGCP();
+  process.exit(0);
+});
+
+process.on('uncaughtException', async (error) => {
+  console.error('[app.js] Uncaught exception:', error);
+  await saveMapToGCP();
+  process.exit(1);
+});
+
+process.on('unhandledRejection', async (reason, promise) => {
+  console.error('[app.js] Unhandled rejection at:', promise, 'reason:', reason);
+  await saveMapToGCP();
+  process.exit(1);
+});
+
+process.on('beforeExit', async () => {
+  console.log('[app.js] Received beforeExit signal.');
+  await saveMapToGCP();
+});
+
+process.nextTick(async () => {
+  console.log('[app.js] Downloading map from GCP...');
+  await downloadMapFromGCP();
+});
